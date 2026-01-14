@@ -41,24 +41,27 @@ jobs:
       - name: Create Vercel project if missing
         run: |
           echo "Checking if Vercel project exists: $PROJECT_NAME"
-
           EXISTS=$(curl -s \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID" \
+            "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID&limit=100" \
             | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
-
+          
           if [ -z "$EXISTS" ]; then
             echo "Creating Vercel project"
-
-            curl -X POST https://api.vercel.com/v13/projects \
+            RESPONSE=$(curl -s -X POST "https://api.vercel.com/v13/projects?teamId=$VERCEL_TEAM_ID" \
               -H "Authorization: Bearer $VERCEL_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{
                 \"name\": \"$PROJECT_NAME\",
-                \"framework\": \"vite\",
-                \"teamId\": \"$VERCEL_TEAM_ID\"
-              }"
-
+                \"framework\": \"vite\"
+              }")
+            
+            # Check if creation succeeded
+            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              echo "Error creating project: $RESPONSE"
+              exit 1
+            fi
+            
             echo "PROJECT_CREATED=true" >> $GITHUB_ENV
           else
             echo "Project already exists"
@@ -68,16 +71,12 @@ jobs:
       - name: Deploy to Vercel
         run: |
           cd "$REPO_NAME"
-
           DEPLOY_OUTPUT=$(npx vercel deploy \
             --token $VERCEL_TOKEN \
-            --confirm \
+            --prod \
             --yes)
-
           echo "$DEPLOY_OUTPUT"
-
           PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo 'https://[^ ]+\.vercel\.app' | head -n 1)
-
           echo "PREVIEW_URL=$PREVIEW_URL" >> $GITHUB_ENV
 
       - name: Notify Make.com (first deployment only)
