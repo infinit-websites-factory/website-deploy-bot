@@ -78,8 +78,17 @@ jobs:
             --yes \
             --name "$PROJECT_NAME")
           echo "$DEPLOY_OUTPUT"
-          PROD_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo 'https://[^ ]+\.vercel\.app' | head -n 1)
-          echo "PROD_URL=$PROD_URL" >> $GITHUB_ENV
+          
+          # Extract the aliased production URL
+          WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'Aliased: \K(https://[^ ]+)' | head -n 1)
+          
+          # Fallback if no alias found
+          if [ -z "$WEBSITE_URL" ]; then
+            WEBSITE_URL="https://$PROJECT_NAME.vercel.app"
+          fi
+          
+          echo "WEBSITE_URL=$WEBSITE_URL" >> $GITHUB_ENV
+          echo "Website URL: $WEBSITE_URL"
 
       - name: Notify Make.com (first deployment only)
         if: env.PROJECT_CREATED == 'true'
@@ -89,5 +98,5 @@ jobs:
             -d "{
               \"repo\": \"$REPO_FULL\",
               \"project\": \"$PROJECT_NAME\",
-              \"preview_url\": \"$PROD_URL\"
+              \"preview_url\": \"$WEBSITE_URL\"
             }"
