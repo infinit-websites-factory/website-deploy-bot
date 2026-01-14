@@ -1,0 +1,92 @@
+name: Deploy to Vercel
+
+on:
+  repository_dispatch:
+    types: [deploy]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+
+    steps:
+      - name: Extract repo info
+        run: |
+          echo "REPO_FULL=${{ github.event.client_payload.repo }}" >> $GITHUB_ENV
+          echo "BRANCH=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
+          echo "REPO_NAME=$(basename ${{ github.event.client_payload.repo }})" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$(echo '${{ github.event.client_payload.repo }}' | sed 's|/|-|g')" >> $GITHUB_ENV
+
+      - name: Clone builder repository
+        run: |
+          git clone \
+            --branch "$BRANCH" \
+            https://x-access-token:${GH_PAT}@github.com/${REPO_FULL}.git
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          cd "$REPO_NAME"
+          npm ci
+
+      - name: Create Vercel project if missing
+        run: |
+          echo "Checking if Vercel project exists: $PROJECT_NAME"
+
+          EXISTS=$(curl -s \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID" \
+            | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating Vercel project"
+
+            curl -X POST https://api.vercel.com/v13/projects \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"$PROJECT_NAME\",
+                \"framework\": \"vite\",
+                \"teamId\": \"$VERCEL_TEAM_ID\"
+              }"
+
+            echo "PROJECT_CREATED=true" >> $GITHUB_ENV
+          else
+            echo "Project already exists"
+            echo "PROJECT_CREATED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy to Vercel
+        run: |
+          cd "$REPO_NAME"
+
+          DEPLOY_OUTPUT=$(npx vercel deploy \
+            --token $VERCEL_TOKEN \
+            --confirm \
+            --yes)
+
+          echo "$DEPLOY_OUTPUT"
+
+          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo 'https://[^ ]+\.vercel\.app' | head -n 1)
+
+          echo "PREVIEW_URL=$PREVIEW_URL" >> $GITHUB_ENV
+
+      - name: Notify Make.com (first deployment only)
+        if: env.PROJECT_CREATED == 'true'
+        run: |
+          curl -X POST "$MAKE_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"repo\": \"$REPO_FULL\",
+              \"project\": \"$PROJECT_NAME\",
+              \"preview_url\": \"$PREVIEW_URL\"
+            }"
