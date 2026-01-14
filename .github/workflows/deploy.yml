@@ -89,5 +89,5 @@ jobs:
             -d "{
               \"repo\": \"$REPO_FULL\",
               \"project\": \"$PROJECT_NAME\",
-              \"preview_url\": \"$PREVIEW_URL\"
+              \"preview_url\": \"$PROD_URL\"
             }"
