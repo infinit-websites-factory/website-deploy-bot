@@ -40,11 +40,11 @@ jobs:
 
       - name: Create Vercel project if missing
         run: |
-          echo "Checking if Vercel project exists: $PROJECT_NAME"
+          echo "Checking if Vercel project exists: $REPO_NAME"
           EXISTS=$(curl -s \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
             "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID&limit=100" \
-            | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
+            | jq -r ".projects[] | select(.name==\"$REPO_NAME\") | .name")
           
           if [ -z "$EXISTS" ]; then
             echo "Creating Vercel project"
@@ -52,11 +52,10 @@ jobs:
               -H "Authorization: Bearer $VERCEL_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{
-                \"name\": \"$PROJECT_NAME\",
+                \"name\": \"$REPO_NAME\",
                 \"framework\": \"vite\"
               }")
             
-            # Check if creation succeeded
             if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
               echo "Error creating project: $RESPONSE"
               exit 1
