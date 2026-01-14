@@ -19,8 +19,9 @@ jobs:
         run: |
           echo "REPO_FULL=${{ github.event.client_payload.repo }}" >> $GITHUB_ENV
           echo "BRANCH=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
-          echo "REPO_NAME=$(basename ${{ github.event.client_payload.repo }})" >> $GITHUB_ENV
-          echo "PROJECT_NAME=$(echo '${{ github.event.client_payload.repo }}' | sed 's|/|-|g')" >> $GITHUB_ENV
+          REPO_NAME=$(basename ${{ github.event.client_payload.repo }})
+          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: Clone builder repository
         run: |
@@ -40,11 +41,11 @@ jobs:
 
       - name: Create Vercel project if missing
         run: |
-          echo "Checking if Vercel project exists: $REPO_NAME"
+          echo "Checking if Vercel project exists: $PROJECT_NAME"
           EXISTS=$(curl -s \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
             "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID&limit=100" \
-            | jq -r ".projects[] | select(.name==\"$REPO_NAME\") | .name")
+            | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
           
           if [ -z "$EXISTS" ]; then
             echo "Creating Vercel project"
@@ -52,7 +53,7 @@ jobs:
               -H "Authorization: Bearer $VERCEL_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{
-                \"name\": \"$REPO_NAME\",
+                \"name\": \"$PROJECT_NAME\",
                 \"framework\": \"vite\"
               }")
             
@@ -72,11 +73,13 @@ jobs:
           cd "$REPO_NAME"
           DEPLOY_OUTPUT=$(npx vercel deploy \
             --token $VERCEL_TOKEN \
+            --scope $VERCEL_TEAM_ID \
             --prod \
-            --yes)
+            --yes \
+            --name "$PROJECT_NAME")
           echo "$DEPLOY_OUTPUT"
-          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo 'https://[^ ]+\.vercel\.app' | head -n 1)
-          echo "PREVIEW_URL=$PREVIEW_URL" >> $GITHUB_ENV
+          PROD_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo 'https://[^ ]+\.vercel\.app' | head -n 1)
+          echo "PROD_URL=$PROD_URL" >> $GITHUB_ENV
 
       - name: Notify Make.com (first deployment only)
         if: env.PROJECT_CREATED == 'true'
