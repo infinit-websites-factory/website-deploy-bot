@@ -79,7 +79,7 @@ jobs:
           echo "$DEPLOY_OUTPUT"
           
           # Extract the aliased production URL
-          WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'Aliased: \K(https://[^ ]+)' | head -n 1)
+          WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep "Aliased:" | grep -o 'https://[^ ]*' | head -n 1)
           
           # Fallback if no alias found
           if [ -z "$WEBSITE_URL" ]; then
