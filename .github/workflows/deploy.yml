@@ -75,7 +75,7 @@ jobs:
             --token $VERCEL_TOKEN \
             --scope $VERCEL_TEAM_ID \
             --prod \
-            --yes)
+            --yes 2>&1)
           echo "$DEPLOY_OUTPUT"
           
           # Extract the aliased production URL
