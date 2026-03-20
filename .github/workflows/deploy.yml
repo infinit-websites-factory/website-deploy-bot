@@ -71,8 +71,15 @@ jobs:
             --token $VERCEL_TOKEN \
             --scope $VERCEL_TEAM_ID \
             --prod \
-            --yes 2>&1)
+            --yes 2>&1) || true
           echo "$DEPLOY_OUTPUT"
+          
+          # Check if deploy actually failed
+          if echo "$DEPLOY_OUTPUT" | grep -q "Error"; then
+            echo "Deployment failed!"
+            echo "$DEPLOY_OUTPUT"
+            exit 1
+          fi
           
           # Extract the aliased production URL
           WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep "Aliased:" | grep -o 'https://[^ ]*' | head -n 1)
