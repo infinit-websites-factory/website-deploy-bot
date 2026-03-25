@@ -17,25 +17,35 @@ jobs:
           echo "BRANCH=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
           REPO_NAME=$(basename ${{ github.event.client_payload.repo }})
           echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
-          # Extract everything before the first "-" as company_id
-          COMPANY_ID=$(echo "$REPO_NAME" | sed 's/-.*//')
+
+          if [[ "$REPO_NAME" == company_* ]]; then
+            COMPANY_ID="${REPO_NAME%%-*}"
+            PROJECT_NAME=$(echo "$REPO_NAME" | sed 's/^[^-]*-//' | tr '[:upper:]' '[:lower:]')
+          else
+            COMPANY_ID=""
+            PROJECT_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          fi
+
           echo "COMPANY_ID=$COMPANY_ID" >> $GITHUB_ENV
-          # Extract everything after the first "-", then lowercase it
-          PROJECT_NAME=$(echo "$REPO_NAME" | sed 's/^[^-]*-//' | tr '[:upper:]' '[:lower:]')
           echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+          echo "Parsed → COMPANY_ID=$COMPANY_ID | PROJECT_NAME=$PROJECT_NAME"
+
       - name: Clone builder repository
         run: |
           git clone \
             --branch "$BRANCH" \
             https://x-access-token:${GH_PAT}@github.com/${REPO_FULL}.git
+
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 20
+
       - name: Install dependencies
         run: |
           cd "$REPO_NAME"
           npm ci
+
       - name: Create Vercel project if missing
         run: |
           echo "Checking if Vercel project exists: $PROJECT_NAME"
@@ -43,7 +53,7 @@ jobs:
             -H "Authorization: Bearer $VERCEL_TOKEN" \
             "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID&limit=100" \
             | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
-          
+
           if [ -z "$EXISTS" ]; then
             echo "Creating Vercel project"
             RESPONSE=$(curl -s -X POST "https://api.vercel.com/v13/projects?teamId=$VERCEL_TEAM_ID" \
@@ -53,17 +63,18 @@ jobs:
                 \"name\": \"$PROJECT_NAME\",
                 \"framework\": \"vite\"
               }")
-            
+
             if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
               echo "Error creating project: $RESPONSE"
               exit 1
             fi
-            
+
             echo "PROJECT_CREATED=true" >> $GITHUB_ENV
           else
             echo "Project already exists"
             echo "PROJECT_CREATED=false" >> $GITHUB_ENV
           fi
+
       - name: Deploy to Vercel
         run: |
           cd "$REPO_NAME"
@@ -73,24 +84,22 @@ jobs:
             --name "$PROJECT_NAME" \
             --prod \
             --yes 2>&1) || true
-          
-          # Check if deploy actually failed
+
           if echo "$DEPLOY_OUTPUT" | grep -q "Error"; then
             echo "Deployment failed!"
             echo "$DEPLOY_OUTPUT"
             exit 1
           fi
-          
-          # Extract the aliased production URL
+
           WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep "Aliased:" | grep -o 'https://[^ ]*' | head -n 1)
-          
-          # Fallback if no alias found
+
           if [ -z "$WEBSITE_URL" ]; then
             WEBSITE_URL="https://$PROJECT_NAME.vercel.app"
           fi
-          
+
           echo "WEBSITE_URL=$WEBSITE_URL" >> $GITHUB_ENV
           echo "Website URL: $WEBSITE_URL"
+
       - name: Notify Make.com (first deployment only)
         if: env.PROJECT_CREATED == 'true'
         run: |
