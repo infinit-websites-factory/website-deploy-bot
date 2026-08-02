@@ -1,113 +1,218 @@
 name: Deploy to Vercel
+
 on:
   repository_dispatch:
     types: [deploy]
+
+# Don't let two dispatches for the same repo race on project creation.
+# cancel-in-progress stays false: never kill a production deploy mid-flight.
+concurrency:
+  group: deploy-${{ github.event.client_payload.repo }}
+  cancel-in-progress: false
+
+permissions: {}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-      VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
-      GH_PAT: ${{ secrets.GH_PAT }}
-      MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+    timeout-minutes: 20
+
     steps:
-      - name: Extract repo info
+      # ------------------------------------------------------------------
+      # 1. Validate the dispatch payload, derive the project name
+      # ------------------------------------------------------------------
+      - name: Resolve names
+        env:
+          # Untrusted input goes through env, never inline ${{ }} in a shell script.
+          PAYLOAD_REPO: ${{ github.event.client_payload.repo }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
         run: |
-          echo "REPO_FULL=${{ github.event.client_payload.repo }}" >> $GITHUB_ENV
-          echo "BRANCH=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
-          REPO_NAME=$(basename ${{ github.event.client_payload.repo }})
-          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+          set -euo pipefail
+
+          [[ "$PAYLOAD_REPO"   =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+            || { echo "::error::invalid repo: $PAYLOAD_REPO"; exit 1; }
+          [[ "$PAYLOAD_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
+            || { echo "::error::invalid branch: $PAYLOAD_BRANCH"; exit 1; }
+
+          slugify() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9]+/-/g; s/-{2,}/-/g; s/^-+//; s/-+$//'
+          }
+
+          REPO_NAME=$(basename "$PAYLOAD_REPO")
 
           if [[ "$REPO_NAME" == company_* ]]; then
-            COMPANY_ID="${REPO_NAME%%-*}"
-            PROJECT_NAME=$(echo "$REPO_NAME" | sed 's/^[^-]*-//' | tr '[:upper:]' '[:lower:]')
+            COMPANY_ID="${REPO_NAME%%-*}"                            # company_5343de7f…
+            SUFFIX="${COMPANY_ID#company_}"; SUFFIX="${SUFFIX:0:4}"  # 5343
+            RAW_NAME="${REPO_NAME#*-}"                               # SV-AUTOMOBILES
           else
             COMPANY_ID=""
-            PROJECT_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+            SUFFIX=""
+            RAW_NAME="$REPO_NAME"
           fi
 
-          echo "COMPANY_ID=$COMPANY_ID" >> $GITHUB_ENV
-          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
-          echo "Parsed → COMPANY_ID=$COMPANY_ID | PROJECT_NAME=$PROJECT_NAME"
+          NAME_SLUG=$(slugify "$RAW_NAME")
+          NAME_SLUG="${NAME_SLUG:0:28}"; NAME_SLUG="${NAME_SLUG%-}"
 
+          PROJECT_NAME="infinit-${NAME_SLUG}${SUFFIX:+-$SUFFIX}"
+
+          {
+            echo "REPO_FULL=$PAYLOAD_REPO"
+            echo "BRANCH=$PAYLOAD_BRANCH"
+            echo "REPO_NAME=$REPO_NAME"
+            echo "COMPANY_ID=$COMPANY_ID"
+            echo "PROJECT_NAME=$PROJECT_NAME"
+          } >> "$GITHUB_ENV"
+
+          echo "Parsed → company=$COMPANY_ID | project=$PROJECT_NAME"
+
+      # ------------------------------------------------------------------
+      # 2. Clone the builder repo (shallow, credentials stripped afterwards)
+      # ------------------------------------------------------------------
       - name: Clone builder repository
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          git clone \
-            --branch "$BRANCH" \
-            https://x-access-token:${GH_PAT}@github.com/${REPO_FULL}.git
+          set -euo pipefail
+          git clone --depth 1 --branch "$BRANCH" \
+            "https://x-access-token:${GH_PAT}@github.com/${REPO_FULL}.git" \
+            "$REPO_NAME"
+          # .git holds the PAT in its config and would be uploaded to Vercel.
+          rm -rf "$REPO_NAME/.git"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
+      # ------------------------------------------------------------------
+      # 3. Look the project up directly (O(1), unaffected by project count)
+      # ------------------------------------------------------------------
+      - name: Ensure Vercel project exists
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
-          cd "$REPO_NAME"
-          npm ci
+          set -euo pipefail
 
-      - name: Create Vercel project if missing
-        run: |
-          echo "Checking if Vercel project exists: $PROJECT_NAME"
-          EXISTS=$(curl -s \
+          STATUS=$(curl -s -o /tmp/project.json -w '%{http_code}' \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v9/projects?teamId=$VERCEL_TEAM_ID&limit=100" \
-            | jq -r ".projects[] | select(.name==\"$PROJECT_NAME\") | .name")
+            "https://api.vercel.com/v9/projects/${PROJECT_NAME}?teamId=${VERCEL_TEAM_ID}")
 
-          if [ -z "$EXISTS" ]; then
-            echo "Creating Vercel project"
-            RESPONSE=$(curl -s -X POST "https://api.vercel.com/v13/projects?teamId=$VERCEL_TEAM_ID" \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"name\": \"$PROJECT_NAME\",
-                \"framework\": \"vite\"
-              }")
-
-            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-              echo "Error creating project: $RESPONSE"
+          case "$STATUS" in
+            200)
+              echo "Project exists"
+              echo "PROJECT_CREATED=false" >> "$GITHUB_ENV"
+              ;;
+            404)
+              echo "Creating project $PROJECT_NAME"
+              curl -sf -X POST \
+                "https://api.vercel.com/v11/projects?teamId=${VERCEL_TEAM_ID}" \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg n "$PROJECT_NAME" '{name: $n, framework: "vite"}')" \
+                -o /tmp/project.json
+              echo "PROJECT_CREATED=true" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Vercel API returned $STATUS"
+              cat /tmp/project.json
               exit 1
-            fi
+              ;;
+          esac
 
-            echo "PROJECT_CREATED=true" >> $GITHUB_ENV
-          else
-            echo "Project already exists"
-            echo "PROJECT_CREATED=false" >> $GITHUB_ENV
-          fi
+          echo "PROJECT_ID=$(jq -r '.id' /tmp/project.json)" >> "$GITHUB_ENV"
 
+      # ------------------------------------------------------------------
+      # 4. Link explicitly, then deploy
+      # ------------------------------------------------------------------
       - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
+          set -euo pipefail
+
+          # Explicit link. Without this the CLI infers the project from the
+          # directory name, which is the repo name, not PROJECT_NAME.
+          mkdir -p "$REPO_NAME/.vercel"
+          jq -n --arg p "$PROJECT_ID" --arg o "$VERCEL_TEAM_ID" \
+            '{projectId: $p, orgId: $o}' > "$REPO_NAME/.vercel/project.json"
+
           cd "$REPO_NAME"
-          DEPLOY_OUTPUT=$(npx vercel deploy \
-            --token $VERCEL_TOKEN \
-            --scope $VERCEL_TEAM_ID \
-            --name "$PROJECT_NAME" \
-            --prod \
-            --yes 2>&1) || true
+          # No `npm ci`: without --prebuilt, Vercel installs and builds remotely.
+          npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN" \
+            | tee /tmp/deploy.log
+          # Non-zero exit now fails the step on its own (pipefail, no `|| true`).
 
-          if echo "$DEPLOY_OUTPUT" | grep -q "Error"; then
-            echo "Deployment failed!"
-            echo "$DEPLOY_OUTPUT"
-            exit 1
-          fi
+          DEPLOYMENT_URL=$(tail -n 1 /tmp/deploy.log | tr -d '\r')
+          echo "DEPLOYMENT_URL=$DEPLOYMENT_URL" >> "$GITHUB_ENV"
 
-          WEBSITE_URL=$(echo "$DEPLOY_OUTPUT" | grep "Aliased:" | grep -o 'https://[^ ]*' | head -n 1)
+      # ------------------------------------------------------------------
+      # 5. Read the real alias — never construct project.vercel.app
+      # ------------------------------------------------------------------
+      - name: Resolve website URL
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          set -euo pipefail
 
-          if [ -z "$WEBSITE_URL" ]; then
-            WEBSITE_URL="https://$PROJECT_NAME.vercel.app"
-          fi
+          ALIAS=$(curl -sf \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects/${PROJECT_ID}?teamId=${VERCEL_TEAM_ID}" \
+            | jq -r '
+                (.targets.production.alias // [])
+                | (map(select(test("vercel\\.app$") | not)) | first)      # custom domain wins
+                  // (map(select(test("vercel\\.app$"))) | sort_by(length) | first)
+                  // empty
+              ')
 
-          echo "WEBSITE_URL=$WEBSITE_URL" >> $GITHUB_ENV
-          echo "Website URL: $WEBSITE_URL"
+          WEBSITE_URL="${ALIAS:+https://$ALIAS}"
+          WEBSITE_URL="${WEBSITE_URL:-$DEPLOYMENT_URL}"
 
+          echo "WEBSITE_URL=$WEBSITE_URL" >> "$GITHUB_ENV"
+          {
+            echo "### Deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Repo | \`$REPO_FULL\` @ \`$BRANCH\` |"
+            echo "| Project | \`$PROJECT_NAME\` |"
+            echo "| URL | $WEBSITE_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 6. Notify Make.com
+      # ------------------------------------------------------------------
       - name: Notify Make.com (first deployment only)
         if: env.PROJECT_CREATED == 'true'
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
         run: |
-          curl -X POST "$MAKE_WEBHOOK_URL" \
+          set -euo pipefail
+          curl -sf -X POST "$MAKE_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"company_id\": \"$COMPANY_ID\",
-              \"repo\": \"$REPO_NAME\",
-              \"project\": \"$PROJECT_NAME\",
-              \"preview_url\": \"$WEBSITE_URL\"
-            }"
+            --retry 3 --retry-connrefused --max-time 30 \
+            -d "$(jq -n \
+                  --arg c "$COMPANY_ID" \
+                  --arg r "$REPO_NAME" \
+                  --arg p "$PROJECT_NAME" \
+                  --arg u "$WEBSITE_URL" \
+                  '{company_id: $c, repo: $r, project: $p, preview_url: $u}')"
+
+      - name: Notify Make.com on failure
+        if: failure()
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+        run: |
+          curl -sf -X POST "$MAKE_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            -d "$(jq -n \
+                  --arg c "${COMPANY_ID:-}" \
+                  --arg r "${REPO_NAME:-}" \
+                  --arg p "${PROJECT_NAME:-}" \
+                  --arg l "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                  '{status: "failed", company_id: $c, repo: $r, project: $p, run_url: $l}')" \
+            || true
