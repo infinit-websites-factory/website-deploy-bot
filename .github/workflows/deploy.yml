@@ -56,12 +56,21 @@ jobs:
 
           PROJECT_NAME="infinit-${NAME_SLUG}${SUFFIX:+-$SUFFIX}"
 
+          # Names projects may already carry from before this convention:
+          #  - LEGACY_STRIPPED: what the old workflow passed to --name
+          #  - LEGACY_FULL:     what the CLI actually used, since --name is
+          #                     ignored and it falls back to the directory name
+          LEGACY_STRIPPED=$(printf '%s' "$RAW_NAME"   | tr '[:upper:]' '[:lower:]')
+          LEGACY_FULL=$(printf '%s' "$REPO_NAME"      | tr '[:upper:]' '[:lower:]')
+
           {
             echo "REPO_FULL=$PAYLOAD_REPO"
             echo "BRANCH=$PAYLOAD_BRANCH"
             echo "REPO_NAME=$REPO_NAME"
             echo "COMPANY_ID=$COMPANY_ID"
             echo "PROJECT_NAME=$PROJECT_NAME"
+            echo "LEGACY_STRIPPED=$LEGACY_STRIPPED"
+            echo "LEGACY_FULL=$LEGACY_FULL"
           } >> "$GITHUB_ENV"
 
           echo "Parsed → company=$COMPANY_ID | project=$PROJECT_NAME"
@@ -92,36 +101,70 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+          # Epoch ms. A project older than this predates the naming change, so a
+          # legacy-name match is safe to adopt. Anything newer that happens to
+          # share a legacy name belongs to a different repo — see notes below.
+          # Set this to the moment you merge this workflow.
+          LEGACY_CUTOFF_MS: "1785542400000"   # 2026-08-02T00:00:00Z
         run: |
           set -euo pipefail
 
-          STATUS=$(curl -s -o /tmp/project.json -w '%{http_code}' \
-            -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v9/projects/${PROJECT_NAME}?teamId=${VERCEL_TEAM_ID}")
+          # Writes /tmp/project.json and returns 0 if the named project exists.
+          fetch_project() {
+            local status
+            status=$(curl -s -o /tmp/candidate.json -w '%{http_code}' \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v9/projects/$1?teamId=${VERCEL_TEAM_ID}")
+            case "$status" in
+              200) mv /tmp/candidate.json /tmp/project.json; return 0 ;;
+              404) return 1 ;;
+              *)   echo "::error::Vercel API returned $status for project $1"
+                   cat /tmp/candidate.json; exit 1 ;;
+            esac
+          }
 
-          case "$STATUS" in
-            200)
-              echo "Project exists"
-              echo "PROJECT_CREATED=false" >> "$GITHUB_ENV"
-              ;;
-            404)
-              echo "Creating project $PROJECT_NAME"
-              curl -sf -X POST \
-                "https://api.vercel.com/v11/projects?teamId=${VERCEL_TEAM_ID}" \
-                -H "Authorization: Bearer $VERCEL_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "$(jq -n --arg n "$PROJECT_NAME" '{name: $n, framework: "vite"}')" \
-                -o /tmp/project.json
-              echo "PROJECT_CREATED=true" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::error::Vercel API returned $STATUS"
-              cat /tmp/project.json
-              exit 1
-              ;;
-          esac
+          RESOLVED=""
 
-          echo "PROJECT_ID=$(jq -r '.id' /tmp/project.json)" >> "$GITHUB_ENV"
+          # 1. Current convention.
+          if fetch_project "$PROJECT_NAME"; then
+            RESOLVED="$PROJECT_NAME"
+            echo "Matched current name: $RESOLVED"
+          else
+            # 2. Legacy conventions, most likely first.
+            for CANDIDATE in "$LEGACY_STRIPPED" "$LEGACY_FULL"; do
+              [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "$PROJECT_NAME" ] || continue
+              if fetch_project "$CANDIDATE"; then
+                CREATED=$(jq -r '.createdAt // 0' /tmp/project.json)
+                if [ "$CREATED" -lt "$LEGACY_CUTOFF_MS" ]; then
+                  RESOLVED="$CANDIDATE"
+                  echo "::notice::Adopting legacy project '$RESOLVED' for $REPO_NAME"
+                  break
+                fi
+                echo "Skipping '$CANDIDATE': created after cutoff, not this repo's project"
+              fi
+            done
+          fi
+
+          if [ -z "$RESOLVED" ]; then
+            echo "Creating project $PROJECT_NAME"
+            curl -sf -X POST \
+              "https://api.vercel.com/v11/projects?teamId=${VERCEL_TEAM_ID}" \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg n "$PROJECT_NAME" '{name: $n, framework: "vite"}')" \
+              -o /tmp/project.json
+            RESOLVED="$PROJECT_NAME"
+            echo "PROJECT_CREATED=true" >> "$GITHUB_ENV"
+          else
+            echo "PROJECT_CREATED=false" >> "$GITHUB_ENV"
+          fi
+
+          # Later values win in GITHUB_ENV, so downstream steps and the Make
+          # payload report the project actually deployed to.
+          {
+            echo "PROJECT_NAME=$RESOLVED"
+            echo "PROJECT_ID=$(jq -r '.id' /tmp/project.json)"
+          } >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
       # 4. Link explicitly, then deploy
